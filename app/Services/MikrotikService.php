@@ -12,9 +12,9 @@ class MikrotikService
     public function __construct()
     {
         $this->client = new Client([
-            'host'     => env('MIKROTIK_HOST', '163.61.244.246'),
-            'user'     => env('MIKROTIK_USER', 'sandi'),
-            'pass'     => env('MIKROTIK_PASS', '88'),
+            'host'     => env('MIKROTIK_HOST', 'ganti ip publik chr'),
+            'user'     => env('MIKROTIK_USER', 'admin'),
+            'pass'     => env('MIKROTIK_PASS', '12344'),
             'port'     => (int) env('MIKROTIK_PORT', 8728),
             'timeout'  => 10,
         ]);
