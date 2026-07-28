@@ -3,9 +3,8 @@
 namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
-use Illuminate\Pagination\LengthAwarePaginator;
-use App\Models\VpnAllocation;
 use App\Services\MikrotikService;
+use Illuminate\Support\Facades\File;
 
 class VpnController extends Controller
 {
@@ -16,111 +15,123 @@ class VpnController extends Controller
         $this->mikrotik = $mikrotik;
     }
 
-    // Menampilkan Halaman Utama (Secret & DST-NAT dengan Paginasi per 10 data)
+    // Fungsi helper untuk menulis log ke file teks
+    private function writeLog($action, $description)
+    {
+        $logPath = storage_path('logs/vpn_activity.log');
+        $username = auth()->user()->name ?? 'System';
+        $timestamp = date('Y-m-d H:i:s');
+        $logEntry = "[$timestamp] | $username | $action | $description\n";
+        
+        File::append($logPath, $logEntry);
+    }
+
     public function index(Request $request)
     {
         $search = $request->input('search');
-        $secrets = [];
         $natRules = [];
+        $secrets = [];
 
         try {
-            $secrets = $this->mikrotik->getSecrets();
-            $natRules = $this->mikrotik->getNatRules();
+            $secrets = array_reverse($this->mikrotik->getSecrets());
+            $natRules = array_reverse($this->mikrotik->getNatRules());
         } catch (\Exception $e) {
             session()->flash('error', 'Gagal terhubung ke MikroTik: ' . $e->getMessage());
         }
 
-        // Filter Pencarian Secret Real-time
         if ($search) {
-            $secrets = array_filter($secrets, function ($item) use ($search) {
+            $secrets = array_filter($secrets, function($item) use ($search) {
                 return stripos($item['name'] ?? '', $search) !== false || 
                        stripos($item['remote-address'] ?? '', $search) !== false;
             });
         }
 
-        // Paginasi Manual array MikroTik per 10 data untuk Secret
-        $currentPage = LengthAwarePaginator::resolveCurrentPage();
-        $perPage = 10;
-        $currentItems = array_slice($secrets, ($currentPage - 1) * $perPage, $perPage);
-        $paginatedSecrets = new LengthAwarePaginator($currentItems, count($secrets), $perPage, $currentPage, [
-            'path' => LengthAwarePaginator::resolveCurrentPath(),
-            'query' => $request->query(),
-        ]);
+        // Baca log dari file teks
+        $logs = [];
+        $logPath = storage_path('logs/vpn_activity.log');
+        if (File::exists($logPath)) {
+            $lines = file($logPath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            $logs = array_reverse(array_slice($lines, -50)); // Ambil 50 log terakhir
+        }
 
         return view('vpn.index', [
-            'secrets' => $paginatedSecrets,
+            'secrets' => $secrets,
             'natRules' => $natRules,
-            'search' => $search
+            'logs' => $logs,
+            'search' => $search,
+            'localVpns' => collect()
         ]);
     }
 
-    // Proses Simpan Secret & Auto NAT
     public function store(Request $request)
     {
         $request->validate([
-            'username' => 'required|string|unique:vpn_allocations,username',
-            'password' => 'required|string',
-            'profile'  => 'required|string',
-            'service'  => 'required|string',
+            'username' => 'required|string|max:255',
+            'password' => 'required|string|max:255',
+            'profile'  => 'required|string|max:255',
+            'service'  => 'required|string|max:255',
         ]);
 
         try {
-            $lastVpn = VpnAllocation::latest()->first();
-            $nextIp = $lastVpn ? long2ip(ip2long($lastVpn->remote_address) + 1) : '10.163.61.2';
+            $localAddress = '10.163.61.1';
+            
+            $secrets = $this->mikrotik->getSecrets();
+            $nextId = count($secrets) + 1;
+            $nextIp = '10.163.61.' . ($nextId + 1);
 
-            $portWww = $lastVpn ? $lastVpn->port_www + 1 : 8102;
-            $portWinbox = $lastVpn ? $lastVpn->port_winbox + 1 : 7102;
-            $portApi = $lastVpn ? $lastVpn->port_api + 1 : 7203;
+            $natRules = $this->mikrotik->getNatRules();
+            $offset = count($natRules) > 0 ? count($natRules) / 3 : 0;
+            
+            $portWww = 8102 + (int)$offset;
+            $portWinbox = 7102 + (int)$offset;
+            $portApi = 7203 + (int)$offset;
 
-            // Eksekusi ke MikroTik CHR
-            $this->mikrotik->addSecret($request->username, $request->password, $request->profile, $request->service, $nextIp);
-            $this->mikrotik->addNatRule($portWww, 80, $nextIp, "WWW-{$request->username}");
-            $this->mikrotik->addNatRule($portWinbox, 8291, $nextIp, "Winbox-{$request->username}");
-            $this->mikrotik->addNatRule($portApi, 8728, $nextIp, "API-{$request->username}");
+            $this->mikrotik->addSecret($request->username, $request->password, $request->profile, $request->service, $nextIp, $localAddress);
 
-            VpnAllocation::create([
-                'username'       => $request->username,
-                'password'       => $request->password,
-                'profile'        => $request->profile,
-                'service'        => $request->service,
-                'remote_address' => $nextIp,
-                'port_www'       => $portWww,
-                'port_winbox'    => $portWinbox,
-                'port_api'       => $portApi,
-            ]);
+            $this->mikrotik->addNatRule('dstnat', '163.61.244.246', $portWww, 'tcp', '80', $nextIp, $request->username . ' - WWW');
+            $this->mikrotik->addNatRule('dstnat', '163.61.244.246', $portWinbox, 'tcp', '8291', $nextIp, $request->username . ' - Winbox');
+            $this->mikrotik->addNatRule('dstnat', '163.61.244.246', $portApi, 'tcp', '8728', $nextIp, $request->username . ' - API');
 
-            return redirect()->route('vpn.index')->with('success', 'VPN Secret & NAT berhasil digenerate ke MikroTik!');
+            // Catat log ke file
+            $this->writeLog('TAMBAH VPN', 'Berhasil menambahkan user ' . $request->username . ' dengan IP ' . $nextIp);
+
+            return redirect()->route('vpn.index')->with('success', 'VPN Secret & Auto NAT berhasil ditambahkan langsung ke MikroTik!');
         } catch (\Exception $e) {
-            return redirect()->route('vpn.index')->with('error', 'Gagal memproses ke MikroTik: ' . $e->getMessage());
+            return redirect()->back()->with('error', 'Gagal menyimpan: ' . $e->getMessage())->withInput();
         }
     }
 
-    // Proses Update Secret
-    public function update(Request $request, $id)
+public function destroy(Request $request, $id)
     {
+        // Hanya admin yang diizinkan menghapus
+        if (strtolower(auth()->user()->role) !== 'admin') {
+            return redirect()->route('vpn.index')->with('error', 'Akses ditolak! Operator tidak diizinkan menghapus data.');
+        }
+
         try {
-            $this->mikrotik->updateSecret($request->mikrotik_id, $request->password, $request->profile);
-            
-            $local = VpnAllocation::where('username', $request->username)->first();
-            if ($local) {
-                $local->update([
-                    'password' => $request->password,
-                    'profile'  => $request->profile,
-                ]);
+            $directName = $request->input('direct_name');
+
+            $secrets = $this->mikrotik->getSecrets();
+            foreach ($secrets as $secret) {
+                if (($secret['name'] ?? '') === $directName || ($secret['id'] ?? '') === $id || (isset($secret['.id']) && $secret['.id'] === $id)) {
+                    $this->mikrotik->removeSecret($secret['.id'] ?? $id);
+                }
             }
 
-            return redirect()->route('vpn.index')->with('success', 'Data PPP Secret berhasil diperbarui!');
+            $natRules = $this->mikrotik->getNatRules();
+            foreach ($natRules as $rule) {
+                $comment = $rule['comment'] ?? '';
+                if (!empty($directName) && stripos($comment, $directName) !== false) {
+                    $this->mikrotik->removeNatRule($rule['.id']);
+                }
+            }
+
+            // Catat log ke file
+            $this->writeLog('HAPUS VPN', 'Menghapus user/rule terkait: ' . ($directName ?? $id));
+
+            return redirect()->route('vpn.index')->with('success', 'Data berhasil dihapus dari MikroTik.');
         } catch (\Exception $e) {
-            return redirect()->route('vpn.index')->with('error', 'Gagal memperbarui secret: ' . $e->getMessage());
+            return redirect()->route('vpn.index')->with('error', 'Gagal menghapus data: ' . $e->getMessage());
         }
-    }
-
-    // Hapus Data
-    public function destroy($id)
-    {
-        $vpn = VpnAllocation::findOrFail($id);
-        $vpn->delete();
-
-        return redirect()->route('vpn.index')->with('success', 'Data VPN berhasil dihapus.');
     }
 }
